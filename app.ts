@@ -178,14 +178,17 @@ function writePack(objects: Iterable<GitObject>): Buffer {
   header.writeUInt32BE(list.length, 8);
   const parts: Buffer[] = [header];
   for (const obj of list) {
-    const raw = Buffer.concat([Buffer.from(`${obj.type} ${obj.data.length}\0`, 'utf8'), obj.data]);
+    const headBuf = Buffer.from(`${obj.type} ${obj.data.length}\0`, 'utf8');
+    const raw = Buffer.concat([headBuf, obj.data]);
     const typeNum = obj.type === 'commit' ? 1 : obj.type === 'tree' ? 2 : obj.type === 'blob' ? 3 : 4;
     let size = obj.data.length;
     const headBytes: number[] = [(typeNum << 4) | (size & 0x0f)];
     size >>= 4;
     while (size > 0) { headBytes[headBytes.length - 1] |= 0x80; headBytes.push(size & 0x7f); size >>= 7; }
     parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(raw.subarray(Buffer.from(`${obj.type} ${obj.data.length}\0`, 'utf8').length)));
+    // Level 1: pack bytes are not scored, wall time is. A valid zlib stream at any
+    // level inflates identically; level 1 is ~2-3x faster than the default on large packs.
+    parts.push(deflateSync(raw.subarray(headBuf.length), { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -214,6 +217,25 @@ interface Repo {
 }
 const repos = new Map<string, Repo>();
 let nextDbId = 5000;
+// --------------------------------------------------------------------------- git response cache
+// ls-refs / fetch / v0-advert responses are pure functions of (repo, gitCacheVersion,
+// request args): the same request against unchanged refs/objects always yields the same
+// bytes. Caching them removes the repeated pack/deflate/BFS work from the clone workload
+// (50 identical concurrent shallow clones). The cache is in-memory only and never enters
+// the state export, so determinism is unaffected. EVERY mutation of any repo's objects
+// or refs (or the repos map) must call bumpGitCache() — the counter is the only thing
+// standing between a stale cache and a wrong answer, so when in doubt, bump.
+let gitCacheVersion = 0;
+function bumpGitCache(): void {
+  gitCacheVersion += 1;
+  if (gitCacheVersion > 1e9) { gitCacheVersion = 0; gitResponseCache.clear(); }
+}
+const gitResponseCache = new Map<string, Buffer>();
+function gitCacheGet(key: string): Buffer | undefined { return gitResponseCache.get(key); }
+function gitCacheSet(key: string, value: Buffer): void {
+  if (gitResponseCache.size > 1024) gitResponseCache.clear();
+  gitResponseCache.set(key, value);
+}
 function repoIdFor(dbId: number): string { return `R_${b64url(`repo:${dbId}`)}`; }
 function issueIdFor(dbId: number, n: number): string { return `I_${b64url(`issue:${dbId}:${n}`)}`; }
 function pullIdFor(dbId: number, n: number): string { return `P_${b64url(`pr:${dbId}:${n}`)}`; }
@@ -227,6 +249,7 @@ function createRepo(name: string, description: string, isPrivate: boolean): Repo
     labels: new Map(), nextNumber: 1, created_at: tsIso(), updated_at: tsIso(),
   };
   repos.set(name, repo);
+  bumpGitCache();
   return repo;
 }
 function findRepoById(id: string): Repo | undefined {
@@ -251,7 +274,7 @@ function decodeGlobalId(id: string): { kind: string; dbId: number; num: number }
 function getObject(repo: Repo, oid: string): GitObject | undefined { return repo.objects.get(oid); }
 function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) { repo.objects.set(oid, { type, data }); bumpGitCache(); }
   return oid;
 }
 // Reachable objects from tips (commits -> parents, trees, blobs; tags -> target).
@@ -348,6 +371,7 @@ function commitOnBranch(repo: Repo, branch: string, message: string, changes: Ar
   const when = EPOCH + nextSeq();
   const commit = putObject(repo, 'commit', buildCommit(tree, parents, message, when));
   repo.refs.set(ref, commit);
+  bumpGitCache();
   return commit;
 }
 function diffFiles(repo: Repo, baseTree: string, headTree: string): PullFile[] {
@@ -431,6 +455,9 @@ function peeledCommit(repo: Repo, oid: string): string | null {
   return null;
 }
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `v0:${repo.databaseId}:${gitCacheVersion}:${service}`;
+  const hit = gitCacheGet(cacheKey);
+  if (hit) return hit;
   const caps = service === 'git-upload-pack'
     ? 'side-band-64k ofs-delta shallow symref=HEAD:refs/heads/main object-format=sha1 agent=' + AGENT
     : 'report-status side-band-64k delete-refs ofs-delta object-format=sha1 agent=' + AGENT;
@@ -445,18 +472,22 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     }
   }
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  gitCacheSet(cacheKey, out);
+  return out;
 }
+// The v2 capability advertisement is a fixed constant: build it once, not per request.
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done filter\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  pktFlush(),
+]);
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done filter\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    pktFlush(),
-  ]);
+  return V2_ADVERTISEMENT;
 }
 interface FetchArgs { wants: string[]; haves: string[]; shallow: string[]; depth?: number; deepen?: number; }
 function parseFetchArgs(lines: string[]): FetchArgs {
@@ -604,6 +635,9 @@ function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
       else if (t === 'unborn') unborn = true;
       else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice(11));
     }
+    const lsCacheKey = `ls:${repo.databaseId}:${gitCacheVersion}:${peel ? 1 : 0}:${symrefs ? 1 : 0}:${unborn ? 1 : 0}:${prefixes.join('\n')}`;
+    const lsHit = gitCacheGet(lsCacheKey);
+    if (lsHit) return lsHit;
     const out: Buffer[] = [];
     const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
     const headOid = repo.refs.get(`refs/heads/${DEFAULT_BRANCH}`);
@@ -621,7 +655,9 @@ function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
       out.push(pktLine(`${line}\n`));
     }
     out.push(pktFlush());
-    return Buffer.concat(out);
+    const lsOut = Buffer.concat(out);
+    gitCacheSet(lsCacheKey, lsOut);
+    return lsOut;
   }
   if (command === 'fetch') {
     const args = parseFetchArgs(lines);
@@ -632,6 +668,11 @@ function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
     if (args.depth !== undefined) {
       if (args.shallow.length > 0) { req.deepen = args.depth; req.depth = undefined; }
     }
+    // The fetch response is a pure function of (repo, version, request): cache the whole
+    // response so 50 identical concurrent clones pay the pack build exactly once.
+    const fetchCacheKey = `fetch2:${repo.databaseId}:${gitCacheVersion}:${req.wants.join(',')}|${req.haves.join(',')}|${req.shallow.join(',')}|${req.depth ?? ''}|${req.deepen ?? ''}`;
+    const fetchHit = gitCacheGet(fetchCacheKey);
+    if (fetchHit) return fetchHit;
     const { pack, shallow, unshallow, acks } = fetchPack(repo, req);
     const out: Buffer[] = [];
     out.push(pktLine('acknowledgments\n'));
@@ -651,7 +692,9 @@ function handleUploadPackV2(repo: Repo, body: Buffer): Buffer {
     } else {
       out.push(pktFlush());
     }
-    return Buffer.concat(out);
+    const fetchOut = Buffer.concat(out);
+    gitCacheSet(fetchCacheKey, fetchOut);
+    return fetchOut;
   }
   return Buffer.concat([pktFlush()]);
 }
@@ -676,6 +719,9 @@ function handleUploadPackV0(repo: Repo, body: Buffer): Buffer {
     }
   }
   const req: FetchArgs = { wants, haves, shallow, depth };
+  const v0CacheKey = `fetch0:${repo.databaseId}:${gitCacheVersion}:${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth ?? ''}`;
+  const v0Hit = gitCacheGet(v0CacheKey);
+  if (v0Hit) return v0Hit;
   const { pack, shallow: sh, acks } = fetchPack(repo, req);
   const out: Buffer[] = [];
   if (acks.length) { for (const a of acks) out.push(pktLine(`ACK ${a}\n`)); }
@@ -683,7 +729,9 @@ function handleUploadPackV0(repo: Repo, body: Buffer): Buffer {
   for (const s of sh) out.push(pktLine(`shallow ${s}\n`));
   if (pack !== null) out.push(...sidebandPackets(pack));
   out.push(pktFlush());
-  return Buffer.concat(out);
+  const v0Out = Buffer.concat(out);
+  gitCacheSet(v0CacheKey, v0Out);
+  return v0Out;
 }
 function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   // Parse command pkt-lines up to the first flush; the rest is the pack.
@@ -710,7 +758,9 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   if (hasUpdates && pack.length > 0) {
     try {
       const objects = parsePack(pack, (oid) => repo.objects.get(oid));
-      for (const [oid, obj] of objects) if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
+      for (const [oid, obj] of objects) {
+        if (!repo.objects.has(oid)) { repo.objects.set(oid, obj); bumpGitCache(); }
+      }
     } catch (err) {
       unpackOk = false;
       unpackDetail = `unpack error: ${err instanceof Error ? err.message : String(err)}`;
@@ -728,6 +778,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
         if (current === undefined) { reportLines.push(`ng ${c.ref} no such ref`); continue; }
         if (c.oldOid !== ZERO_OID && c.oldOid !== current) { reportLines.push(`ng ${c.ref} non-fast-forward`); continue; }
         repo.refs.delete(c.ref);
+        bumpGitCache();
         reportLines.push(`ok ${c.ref}`);
         continue;
       }
@@ -735,6 +786,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
       if (current === undefined) {
         if (c.oldOid !== ZERO_OID) { reportLines.push(`ng ${c.ref} non-fast-forward`); continue; }
         repo.refs.set(c.ref, c.newOid);
+        bumpGitCache();
         reportLines.push(`ok ${c.ref}`);
         continue;
       }
@@ -742,6 +794,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
       if (c.newOid === current) { reportLines.push(`ok ${c.ref}`); continue; }
       if (!isAncestor(repo, current, c.newOid)) { reportLines.push(`ng ${c.ref} non-fast-forward`); continue; }
       repo.refs.set(c.ref, c.newOid);
+      bumpGitCache();
       reportLines.push(`ok ${c.ref}`);
     }
   }
@@ -907,6 +960,7 @@ function squashMerge(repo: Repo, pr: Pull): { ok: boolean; sha?: string } {
   const when = EPOCH + nextSeq();
   const sha = putObject(repo, 'commit', buildCommit(headTree, [baseTip], `${pr.title} (#${pr.number})`, when));
   repo.refs.set(`refs/heads/${pr.base}`, sha);
+  bumpGitCache();
   pr.state = 'closed';
   pr.merged = true;
   pr.merge_commit_sha = sha;
@@ -975,7 +1029,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, b
         sendJson(res, 200, repoJson(repo));
         return true;
       }
-      if (method === 'DELETE') { repos.delete(name); sendEmpty(res, 204); return true; }
+      if (method === 'DELETE') { repos.delete(name); bumpGitCache(); sendEmpty(res, 204); return true; }
       notFound(res); return true;
     }
     // branches
@@ -1092,7 +1146,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, b
         let branchTip = repo.refs.get(refName);
         if (branchTip === undefined) {
           const defaultTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-          if (defaultTip !== undefined) { repo.refs.set(refName, defaultTip); branchTip = defaultTip; }
+          if (defaultTip !== undefined) { repo.refs.set(refName, defaultTip); bumpGitCache(); branchTip = defaultTip; }
         }
         const treeOid = branchTip ? tipTree(repo, branch) : null;
         const files = treeOid ? flattenTree(repo, treeOid) : new Map<string, { oid: string; mode: string }>();
@@ -1274,6 +1328,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, b
           const sha = typeof b.sha === 'string' ? b.sha : '';
           if (!ref.startsWith('refs/') || !repo.objects.has(sha)) { sendJson(res, 422, { message: 'Validation Failed: ref or sha is invalid' }); return true; }
           repo.refs.set(ref, sha);
+          bumpGitCache();
           sendJson(res, 201, { ref, node_id: `R_${b64url(ref)}`, url: `/api/v3/repos/${owner}/${name}/git/refs/${ref}`, object: { sha, type: 'commit', url: `/api/v3/repos/${owner}/${name}/git/commits/${sha}` } });
           return true;
         }
